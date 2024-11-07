@@ -1,0 +1,155 @@
+type: charm
+name: cinder-truenas
+summary: OpenStack volume service - TrueNAS backend
+description: |
+  Cinder is the OpenStack project that provides volume management for
+  instances.  This charm provides integration with TrueNAS storage
+  backends.
+assumes:
+  - juju >= 3.1
+links:
+  source:
+    - https://opendev.org/openstack/charm-cinder-ceph-k8s
+  issues:
+    - https://bugs.launchpad.net/charm-cinder-ceph-k8s
+
+base: ubuntu@22.04
+platforms:
+  amd64:
+
+config:
+  options:
+    debug:
+      type: boolean
+      default: false
+      description: Enable debug logging.
+    snap-channel:
+      default: 2024.1/edge
+      type: string
+    volume-backend-name:
+      default: null
+      type: string
+      description: |
+        Volume backend name for the backend. The default value is the
+        application name in the Juju model, e.g. "cinder-ceph-mybackend"
+        if it's deployed as `juju deploy cinder-ceph cinder-ceph-mybackend`.
+        A common backend name can be set to multiple backends with the
+        same characters so that those can be treated as a single virtual
+        backend associated with a single volume type.
+    backend-availability-zone:
+      default: null
+      type: string
+      description: |
+        Availability zone name of this volume backend. If set, it will
+        override the default availability zone. Supported for Pike or
+        newer releases.
+    rabbit-user:
+      type: string
+      default: null
+      description: Username to request access on rabbitmq-server.
+    rabbit-vhost:
+      type: string
+      default: null
+      description: RabbitMQ virtual host to request access on rabbitmq-server.
+    enable-telemetry-notifications:
+      type: boolean
+      default: false
+      description: Enable notifications to send to telemetry.
+    image-volume-cache-enabled:
+      type: boolean
+      default: false
+      description: |
+        Enable the image volume cache.
+    image-volume-cache-max-size-gb:
+      type: int
+      default: 0
+      description: |
+        Max size of the image volume cache in GB. 0 means unlimited.
+    image-volume-cache-max-count:
+      type: int
+      default: 0
+      description: |
+        Max number of entries allowed in the image volume cache. 0 means
+        unlimited.
+    # ixsystems-specific configuration
+    login:
+      type: string
+      description: |
+        The username to use to connect to the iXsystems storage backend.
+    password:
+      type: string
+      description: |
+        The password to use to connect to the iXsystems storage backend.
+    server-hostname:
+      type: string
+      description: |
+        The hostname or IP address of the iXsystems storage backend.
+    transport-type:
+      type: string
+      description: |
+        The transport type to use to connect to the iXsystems storage backend.
+    iqn-prefix:
+      type: string
+      description: |
+        The iSCSI IQN prefix to use when connecting to the iXsystems storage backend.
+    datastore-pool:
+      type: string
+      description: |
+        The name of the datastore pool to use on the iXsystems storage backend.
+    dataset-path:
+      type: string
+      description: |
+        The path to the dataset to use on the iXsystems storage backend.
+    portal-id:
+      type: int
+      description: |
+        The portal ID to use when connecting to the iXsystems storage backend.
+    initiator-id:
+      type: int
+      description: |
+        The initiator ID to use when connecting to the iXsystems storage backend.
+
+requires:
+  amqp:
+    interface: rabbitmq
+  database:
+    interface: mysql_client
+    limit: 1
+  identity-credentials:
+    interface: keystone-credentials
+    optional: true
+  tracing:
+    interface: tracing
+    optional: true
+    limit: 1
+
+provides:
+  storage-backend:
+    interface: cinder-backend
+
+peers:
+  peers:
+    interface: cinder-peer
+
+parts:
+  update-certificates:
+    plugin: nil
+    override-build: |
+      apt update
+      apt install -y ca-certificates
+      update-ca-certificates
+  charm:
+    after:
+      - update-certificates
+    build-packages:
+      - git
+      - libffi-dev
+      - libssl-dev
+      - pkg-config
+      - rustc
+      - cargo
+    charm-binary-python-packages:
+      - cryptography
+      - jsonschema
+      - pydantic
+      - jinja2
