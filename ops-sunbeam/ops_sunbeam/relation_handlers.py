@@ -327,6 +327,7 @@ class DBHandler(RelationHandler):
             self.relation_name,
             self.database_name,
             relations_aliases=[alias],
+            external_node_connectivity=True,
         )
         self.framework.observe(
             # db.on[f"{alias}_database_created"], # this doesn't work because:
