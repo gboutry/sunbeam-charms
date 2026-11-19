@@ -17,12 +17,17 @@
 """ops.testing (state-transition) tests for openstack-network-agents."""
 
 import ipaddress
+import json
+from dataclasses import (
+    replace,
+)
 from unittest.mock import (
     MagicMock,
     PropertyMock,
 )
 
 import charm
+import pytest
 from ops import (
     testing,
 )
@@ -258,6 +263,7 @@ class TestConfigureSnap:
         with ctx(ctx.on.config_changed(), complete_state) as mgr:
             charm_instance = mgr.charm
             mock_snap = MagicMock(name="openstack-network-agents")
+            mock_snap.get.return_value = {}
             charm_instance.get_snap = MagicMock(return_value=mock_snap)
             charm_instance.set_snap_data = MagicMock()
 
@@ -280,6 +286,7 @@ class TestConfigureSnap:
         with ctx(ctx.on.config_changed(), state_in) as mgr:
             charm_instance = mgr.charm
             mock_snap = MagicMock(name="openstack-network-agents")
+            mock_snap.get.return_value = {}
             charm_instance.get_snap = MagicMock(return_value=mock_snap)
             charm_instance.set_snap_data = MagicMock()
 
@@ -423,6 +430,247 @@ class TestSetNetworkAgentsLocalSettingsAction:
             charm_instance._set_network_agents_local_settings_action(evt)
 
             charm_instance.set_snap_data.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: dynamic routing agent instances
+# ---------------------------------------------------------------------------
+
+
+class TestDynamicRoutingInstances:
+    """Reconcile the selected agent list and relation-provided transport."""
+
+    instances = [
+        {
+            "domain": "client1",
+            "family": "ipv4",
+            "service-name": "agent-client1-v4",
+            "host": "agent-client1-v4-net-01",
+            "router-id": "192.0.2.3",
+        },
+        {
+            "domain": "internet",
+            "family": "ipv4",
+            "service-name": "agent-internet-v4",
+            "host": "agent-internet-v4-net-01",
+            "router-id": "192.0.2.4",
+        },
+    ]
+
+    def test_action_passes_all_instances_and_requests_shared_vhost(
+        self, ctx, complete_state
+    ):
+        """A single unit receives distinct processes and the Rabbit transport."""
+        relation = testing.Relation(
+            endpoint="amqp",
+            remote_app_data={"hostname": "broker", "password": "has:@!"},
+        )
+        state = replace(
+            complete_state, relations=[*complete_state.relations, relation]
+        )
+        event = ctx.on.action(
+            "set-dynamic-routing-instances",
+            {"instances": json.dumps(self.instances)},
+        )
+        with ctx(event, state) as manager:
+            snap_service = manager.charm.get_snap()
+            state_out = manager.run()
+        config = json.loads(snap_service.set.call_args.args[0]["ndr.config"])
+        assert config == {
+            "instances": self.instances,
+            "transport-url": (
+                "rabbit://openstack-network-agents:has%3A%40%21@broker:5672/openstack"
+            ),
+        }
+        assert ctx.action_results == {"configured": True, "instances": 2}
+
+        snap_service.set.reset_mock()
+        snap_service.get.return_value = {
+            "ndr": {"config": json.dumps(config, sort_keys=True)}
+        }
+        ctx.run(event, state_out)
+        snap_service.set.assert_not_called()
+
+        state_out = ctx.run(ctx.on.relation_joined(relation), state_out)
+        data = state_out.get_relation(relation.id).local_app_data
+        assert data["vhost"] == "openstack"
+        assert data["external_connectivity"] == "true"
+
+    @pytest.mark.parametrize("dual_stack", [False, True])
+    def test_accepts_ipv6_instances(self, ctx, complete_state, dual_stack):
+        """Pass one IPv6 speaker slot and an optional IPv4 slot for the same domain."""
+        relation = testing.Relation(
+            endpoint="amqp",
+            remote_app_data={"hostname": "broker", "password": "pass"},
+        )
+        state = replace(
+            complete_state, relations=[*complete_state.relations, relation]
+        )
+        ipv6 = {
+            "domain": "client1",
+            "family": "ipv6",
+            "service-name": "agent-client1-v6",
+            "host": "agent-client1-v6-net-01",
+            "router-id": "192.0.2.5",
+        }
+        instances = [self.instances[0], ipv6] if dual_stack else [ipv6]
+        event = ctx.on.action(
+            "set-dynamic-routing-instances",
+            {"instances": json.dumps(instances)},
+        )
+        with ctx(event, state) as manager:
+            snap_service = manager.charm.get_snap()
+            manager.run()
+        config = json.loads(snap_service.set.call_args.args[0]["ndr.config"])
+        assert config["instances"] == instances
+        assert ctx.action_results == {
+            "configured": True,
+            "instances": len(instances),
+        }
+
+    def test_relation_recovery_reuses_snap_placement(
+        self, ctx, complete_state
+    ):
+        """Lose the credentials and recover the placement across hook invocations."""
+        relation = testing.Relation(
+            endpoint="amqp",
+            remote_app_data={"hostname": "broker", "password": "pass"},
+        )
+        state = replace(
+            complete_state, relations=[*complete_state.relations, relation]
+        )
+        event = ctx.on.action(
+            "set-dynamic-routing-instances",
+            {"instances": json.dumps(self.instances)},
+        )
+        with ctx(event, state) as manager:
+            snap_service = manager.charm.get_snap()
+            snap_service.present = True
+            state_out = manager.run()
+        snap_service.get.return_value = {
+            "ndr": {"config": snap_service.set.call_args.args[0]["ndr.config"]}
+        }
+        snap_service.set.reset_mock()
+        broken = ctx.run(ctx.on.relation_broken(relation), state_out)
+        paused = snap_service.set.call_args.args[0]["ndr.config"]
+        assert json.loads(paused) == {
+            "instances": [],
+            "paused-instances": self.instances,
+        }
+
+        snap_service.get.return_value = {"ndr": {"config": paused}}
+        snap_service.set.reset_mock()
+        recovered = testing.Relation(
+            endpoint="amqp",
+            remote_app_data={"hostname": "new-broker", "password": "new-pass"},
+        )
+        state = replace(
+            broken, relations=[*complete_state.relations, recovered]
+        )
+        ctx.run(ctx.on.relation_changed(recovered), state)
+        config = json.loads(snap_service.set.call_args.args[0]["ndr.config"])
+        assert config == {
+            "instances": self.instances,
+            "transport-url": "rabbit://openstack-network-agents:new-pass@new-broker:5672/openstack",
+        }
+
+    def test_empty_action_clears_placement_without_amqp(
+        self, ctx, complete_state
+    ):
+        """An explicit clear takes precedence over an older stored placement."""
+        event = ctx.on.action(
+            "set-dynamic-routing-instances", {"instances": "[]"}
+        )
+        with ctx(event, complete_state) as manager:
+            snap_service = manager.charm.get_snap()
+            manager.charm._state.ndr_instances = json.dumps(self.instances)
+            state_out = manager.run()
+            assert manager.charm._state.ndr_instances is None
+        cleared = snap_service.set.call_args.args[0]["ndr.config"]
+        assert json.loads(cleared) == {"instances": []}
+        assert ctx.action_results == {"configured": True, "instances": 0}
+
+        snap_service.get.return_value = {"ndr": {"config": cleared}}
+        snap_service.set.reset_mock()
+        relation = testing.Relation(
+            endpoint="amqp",
+            remote_app_data={"hostname": "broker", "password": "pass"},
+        )
+        state = replace(
+            state_out, relations=[*complete_state.relations, relation]
+        )
+        ctx.run(ctx.on.relation_changed(relation), state)
+        assert all(
+            "ndr.config" not in call.args[0]
+            for call in snap_service.set.call_args_list
+        )
+
+    def test_tls_port_requires_trust_material(self, ctx, complete_state):
+        """An advertised TLS port cannot start agents without a valid CA."""
+        relation = testing.Relation(
+            endpoint="amqp",
+            remote_app_data={
+                "hostname": "broker",
+                "password": "pass",
+                "ssl_port": "5671",
+            },
+        )
+        state = replace(
+            complete_state, relations=[*complete_state.relations, relation]
+        )
+        event = ctx.on.action(
+            "set-dynamic-routing-instances",
+            {"instances": json.dumps(self.instances)},
+        )
+        with ctx(event, state) as manager:
+            snap_service = manager.charm.get_snap()
+            manager.run()
+        assert json.loads(
+            snap_service.set.call_args.args[0]["ndr.config"]
+        ) == {
+            "instances": [],
+            "paused-instances": self.instances,
+        }
+        assert ctx.action_results == {"configured": False, "instances": 2}
+
+    def test_invalid_duplicate_plan_does_not_set_snap(
+        self, ctx, complete_state
+    ):
+        """Reject two IPv4 instances of one domain even with distinct identities."""
+        second = {**self.instances[1], "domain": self.instances[0]["domain"]}
+
+        event = ctx.on.action(
+            "set-dynamic-routing-instances",
+            {"instances": json.dumps([self.instances[0], second])},
+        )
+        with ctx(event, complete_state) as manager:
+            snap_service = manager.charm.get_snap()
+            with pytest.raises(
+                testing.ActionFailed, match="Invalid dynamic routing"
+            ):
+                manager.run()
+        snap_service.set.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "override", [{"family": "other"}, {"router-id": "2001:db8::1"}]
+    )
+    def test_invalid_address_settings(self, ctx, complete_state, override):
+        """Reject an unsupported address family or an IPv6 router ID."""
+        event = ctx.on.action(
+            "set-dynamic-routing-instances",
+            {
+                "instances": json.dumps(
+                    [{**self.instances[0], "family": "ipv6", **override}]
+                )
+            },
+        )
+        with ctx(event, complete_state) as manager:
+            snap_service = manager.charm.get_snap()
+            with pytest.raises(
+                testing.ActionFailed, match="Invalid dynamic routing"
+            ):
+                manager.run()
+        snap_service.set.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -590,6 +838,7 @@ class TestDataBinding:
         with ctx(ctx.on.config_changed(), state_in) as mgr:
             charm_instance = mgr.charm
             mock_snap_obj = MagicMock(name="openstack-network-agents")
+            mock_snap_obj.get.return_value = {}
             charm_instance.get_snap = MagicMock(return_value=mock_snap_obj)
             charm_instance.set_snap_data = MagicMock()
 
@@ -609,6 +858,7 @@ class TestDataBinding:
         with ctx(ctx.on.config_changed(), complete_state) as mgr:
             charm_instance = mgr.charm
             mock_snap_obj = MagicMock(name="openstack-network-agents")
+            mock_snap_obj.get.return_value = {}
             charm_instance.get_snap = MagicMock(return_value=mock_snap_obj)
             charm_instance.set_snap_data = MagicMock()
 
