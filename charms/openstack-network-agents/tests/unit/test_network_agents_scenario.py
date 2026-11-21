@@ -27,6 +27,7 @@ from unittest.mock import (
 )
 
 import charm
+import ndr_peering
 import pytest
 from ops import (
     testing,
@@ -447,6 +448,13 @@ class TestDynamicRoutingInstances:
             "service-name": "agent-client1-v4",
             "host": "agent-client1-v4-net-01",
             "router-id": "192.0.2.3",
+            "peering": {
+                "provider-trunk": {
+                    "physnet": "external",
+                    "vlan": 101,
+                    "address": "192.0.2.3/24",
+                }
+            },
         },
         {
             "domain": "internet",
@@ -454,8 +462,130 @@ class TestDynamicRoutingInstances:
             "service-name": "agent-internet-v4",
             "host": "agent-internet-v4-net-01",
             "router-id": "192.0.2.4",
+            "peering": {
+                "dedicated-uplink": {
+                    "interface": "eno1",
+                    "address": "192.0.2.4",
+                }
+            },
         },
     ]
+
+    @pytest.fixture(autouse=True)
+    def mock_host_tools(self, monkeypatch, tmp_path):
+        """Provide a snap boundary without modifying host networking."""
+
+        def run_dynamic_routing(charm_instance, command, payload=None):
+            if command == "validate":
+                return {
+                    "contract-version": 1,
+                    "instances": json.loads(payload),
+                    "managed-addresses": {},
+                }
+            assert command == "reconcile"
+            return {"ready": True}
+
+        monkeypatch.setattr(
+            charm.OpenstackNetworkAgentsOperatorCharm,
+            "_run_dynamic_routing",
+            run_dynamic_routing,
+        )
+        monkeypatch.setattr(ndr_peering, "NETPLAN_PATH", tmp_path / "ndr.yaml")
+
+    def test_validate_returns_canonical_plan_without_mutations(
+        self, ctx, complete_state
+    ):
+        """Authorize the complete plan before any snap config or Netplan change."""
+        event = ctx.on.action(
+            "validate-dynamic-routing-instances",
+            {"contract-version": 1, "instances": json.dumps(self.instances)},
+        )
+        with ctx(event, complete_state) as manager:
+            snap_service = manager.charm.get_snap()
+            manager.run()
+        assert ctx.action_results == {
+            "contract-version": 1,
+            "instances": json.dumps(self.instances),
+            "saved-instances": "[]",
+        }
+        snap_service.set.assert_not_called()
+        assert not ndr_peering.NETPLAN_PATH.exists()
+
+    def test_apply_orders_protection_address_and_readiness(
+        self, ctx, complete_state, monkeypatch
+    ):
+        """Provision the protected port before Netplan and check readiness last."""
+        calls = []
+        resolved = [self.instances[0]]
+
+        def run_snap(charm_instance, command, payload=None):
+            calls.append(command)
+            if command == "validate":
+                assert json.loads(payload) == resolved
+                return {
+                    "contract-version": 1,
+                    "instances": resolved,
+                    "managed-addresses": {"ndr-1a2b": "192.0.2.3/24"},
+                }
+            return {"ready": calls.count("reconcile") > 1}
+
+        def apply_addresses(path, addresses):
+            assert addresses == {"ndr-1a2b": "192.0.2.3/24"}
+            calls.append("addresses")
+
+        monkeypatch.setattr(
+            charm.OpenstackNetworkAgentsOperatorCharm,
+            "_run_dynamic_routing",
+            run_snap,
+        )
+        monkeypatch.setattr(
+            ndr_peering, "reconcile_addresses", apply_addresses
+        )
+        relation = testing.Relation(
+            endpoint="amqp",
+            remote_app_data={"hostname": "broker", "password": "pass"},
+        )
+        state = replace(
+            complete_state, relations=[*complete_state.relations, relation]
+        )
+        event = ctx.on.action(
+            "set-dynamic-routing-instances",
+            {"contract-version": 1, "instances": json.dumps(resolved)},
+        )
+        with ctx(event, state) as manager:
+            manager.charm.get_snap().set.side_effect = (
+                lambda *args, **kwargs: calls.append("configure snap")
+            )
+            manager.run()
+        assert calls == [
+            "validate",
+            "configure snap",
+            "addresses",
+            "reconcile",
+            "reconcile",
+        ]
+        assert ctx.action_results == {"configured": True, "instances": 1}
+
+    def test_incompatible_snap_preflight_does_not_write(
+        self, ctx, complete_state, monkeypatch
+    ):
+        """Don't apply a plan when the local snap lacks the contract."""
+        monkeypatch.setattr(
+            charm.OpenstackNetworkAgentsOperatorCharm,
+            "_run_dynamic_routing",
+            lambda *args: {"contract-version": 2},
+        )
+        event = ctx.on.action(
+            "set-dynamic-routing-instances",
+            {"contract-version": 1, "instances": json.dumps(self.instances)},
+        )
+        with ctx(event, complete_state) as manager:
+            snap_service = manager.charm.get_snap()
+            with pytest.raises(
+                testing.ActionFailed, match="incompatible NDR contract"
+            ):
+                manager.run()
+        snap_service.set.assert_not_called()
 
     def test_action_passes_all_instances_and_requests_shared_vhost(
         self, ctx, complete_state
@@ -470,7 +600,7 @@ class TestDynamicRoutingInstances:
         )
         event = ctx.on.action(
             "set-dynamic-routing-instances",
-            {"instances": json.dumps(self.instances)},
+            {"contract-version": 1, "instances": json.dumps(self.instances)},
         )
         with ctx(event, state) as manager:
             snap_service = manager.charm.get_snap()
@@ -496,9 +626,8 @@ class TestDynamicRoutingInstances:
         assert data["vhost"] == "openstack"
         assert data["external_connectivity"] == "true"
 
-    @pytest.mark.parametrize("dual_stack", [False, True])
-    def test_accepts_ipv6_instances(self, ctx, complete_state, dual_stack):
-        """Pass one IPv6 speaker slot and an optional IPv4 slot for the same domain."""
+    def test_accepts_ipv6_instances(self, ctx, complete_state):
+        """Pass one IPv6 speaker slot with a numbered IPv6 attachment."""
         relation = testing.Relation(
             endpoint="amqp",
             remote_app_data={"hostname": "broker", "password": "pass"},
@@ -512,11 +641,17 @@ class TestDynamicRoutingInstances:
             "service-name": "agent-client1-v6",
             "host": "agent-client1-v6-net-01",
             "router-id": "192.0.2.5",
+            "peering": {
+                "dedicated-uplink": {
+                    "interface": "eno2",
+                    "address": "2001:db8::1",
+                }
+            },
         }
-        instances = [self.instances[0], ipv6] if dual_stack else [ipv6]
+        instances = [ipv6]
         event = ctx.on.action(
             "set-dynamic-routing-instances",
-            {"instances": json.dumps(instances)},
+            {"contract-version": 1, "instances": json.dumps(instances)},
         )
         with ctx(event, state) as manager:
             snap_service = manager.charm.get_snap()
@@ -541,7 +676,7 @@ class TestDynamicRoutingInstances:
         )
         event = ctx.on.action(
             "set-dynamic-routing-instances",
-            {"instances": json.dumps(self.instances)},
+            {"contract-version": 1, "instances": json.dumps(self.instances)},
         )
         with ctx(event, state) as manager:
             snap_service = manager.charm.get_snap()
@@ -579,7 +714,8 @@ class TestDynamicRoutingInstances:
     ):
         """An explicit clear takes precedence over an older stored placement."""
         event = ctx.on.action(
-            "set-dynamic-routing-instances", {"instances": "[]"}
+            "set-dynamic-routing-instances",
+            {"contract-version": 1, "instances": "[]"},
         )
         with ctx(event, complete_state) as manager:
             snap_service = manager.charm.get_snap()
@@ -605,14 +741,24 @@ class TestDynamicRoutingInstances:
             for call in snap_service.set.call_args_list
         )
 
-    def test_tls_port_requires_trust_material(self, ctx, complete_state):
-        """An advertised TLS port cannot start agents without a valid CA."""
+    @pytest.mark.parametrize(
+        "tls_data",
+        [
+            {"ssl_port": "5671"},
+            {"ssl_ca": "CA arrived before the port"},
+            {"ssl_port": "5671", "ssl_ca": "invalid certificate"},
+        ],
+    )
+    def test_tls_requires_complete_configuration(
+        self, ctx, complete_state, tls_data
+    ):
+        """An incomplete or invalid TLS setup cannot start agents."""
         relation = testing.Relation(
             endpoint="amqp",
             remote_app_data={
                 "hostname": "broker",
                 "password": "pass",
-                "ssl_port": "5671",
+                **tls_data,
             },
         )
         state = replace(
@@ -620,7 +766,7 @@ class TestDynamicRoutingInstances:
         )
         event = ctx.on.action(
             "set-dynamic-routing-instances",
-            {"instances": json.dumps(self.instances)},
+            {"contract-version": 1, "instances": json.dumps(self.instances)},
         )
         with ctx(event, state) as manager:
             snap_service = manager.charm.get_snap()
@@ -641,12 +787,15 @@ class TestDynamicRoutingInstances:
 
         event = ctx.on.action(
             "set-dynamic-routing-instances",
-            {"instances": json.dumps([self.instances[0], second])},
+            {
+                "contract-version": 1,
+                "instances": json.dumps([self.instances[0], second]),
+            },
         )
         with ctx(event, complete_state) as manager:
             snap_service = manager.charm.get_snap()
             with pytest.raises(
-                testing.ActionFailed, match="Invalid dynamic routing"
+                testing.ActionFailed, match="duplicate instance domain"
             ):
                 manager.run()
         snap_service.set.assert_not_called()
@@ -659,16 +808,15 @@ class TestDynamicRoutingInstances:
         event = ctx.on.action(
             "set-dynamic-routing-instances",
             {
+                "contract-version": 1,
                 "instances": json.dumps(
                     [{**self.instances[0], "family": "ipv6", **override}]
-                )
+                ),
             },
         )
         with ctx(event, complete_state) as manager:
             snap_service = manager.charm.get_snap()
-            with pytest.raises(
-                testing.ActionFailed, match="Invalid dynamic routing"
-            ):
+            with pytest.raises(testing.ActionFailed, match="ipv[46]|IPv4"):
                 manager.run()
         snap_service.set.assert_not_called()
 
@@ -676,6 +824,62 @@ class TestDynamicRoutingInstances:
 # ---------------------------------------------------------------------------
 # Tests: microovn readiness (via microovn status parsing)
 # ---------------------------------------------------------------------------
+
+
+class TestDynamicRoutingLogging:
+    """Configure the independent NDR log forwarding interface."""
+
+    def test_logging_relation_updates_only_logging(self, ctx, complete_state):
+        """Relating and removing Loki leave the agent plan untouched."""
+        url = "https://loki.example/loki/api/v1/push"
+        relation = testing.Relation(
+            endpoint="logging",
+            remote_units_data={0: {"endpoint": json.dumps({"url": url})}},
+        )
+        state = replace(
+            complete_state, relations=[*complete_state.relations, relation]
+        )
+        with ctx(ctx.on.relation_changed(relation), state) as manager:
+            snap_service = manager.charm.get_snap()
+            snap_service.present = True
+            state_out = manager.run()
+        snap_service.set.assert_called_once()
+        values = snap_service.set.call_args.args[0]
+        assert values.keys() == {"ndr.logging"}
+        logging = json.loads(values["ndr.logging"])
+        assert logging["endpoints"] == [url]
+        assert set(logging["labels"]) == {
+            "juju_model",
+            "juju_model_uuid",
+            "juju_application",
+            "juju_unit",
+        }
+
+        snap_service.get.return_value = {
+            "ndr": {"logging": values["ndr.logging"]}
+        }
+        snap_service.set.reset_mock()
+        ctx.run(ctx.on.relation_broken(relation), state_out)
+        snap_service.set.assert_called_once()
+        values = snap_service.set.call_args.args[0]
+        assert values.keys() == {"ndr.logging"}
+        assert json.loads(values["ndr.logging"])["endpoints"] == []
+
+    def test_malformed_logging_data_does_not_block_the_charm(
+        self, ctx, complete_state
+    ):
+        """Log endpoint errors neither change forwarding nor break NDR."""
+        relation = testing.Relation(
+            endpoint="logging", remote_units_data={0: {"endpoint": "not json"}}
+        )
+        state = replace(
+            complete_state, relations=[*complete_state.relations, relation]
+        )
+        with ctx(ctx.on.relation_changed(relation), state) as manager:
+            snap_service = manager.charm.get_snap()
+            snap_service.present = True
+            manager.run()
+        snap_service.set.assert_not_called()
 
 
 class TestMicroovnReadiness:

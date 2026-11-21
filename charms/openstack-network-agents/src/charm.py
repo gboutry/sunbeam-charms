@@ -31,15 +31,21 @@ import re
 import subprocess
 from urllib.parse import (
     quote,
+    urlsplit,
 )
 
 import charms.operator_libs_linux.v2.snap as snap
+import ndr_peering
 import ops
 import ops_sunbeam.charm as sunbeam_charm
 import ops_sunbeam.guard as sunbeam_guard
 import ops_sunbeam.relation_handlers as sunbeam_rhandlers
 import ops_sunbeam.tracing as sunbeam_tracing
+import tenacity
 import yaml
+from charms.loki_k8s.v1.loki_push_api import (
+    LokiPushApiConsumer,
+)
 from cryptography import (
     x509,
 )
@@ -52,22 +58,22 @@ OVN_CHASSIS_PLUG = "ovn-chassis"
 OVN_CHASSIS_SLOT = "microovn:ovn-chassis"
 DATA_BINDING = "data"
 NDR_CONFIG = "ndr.config"
+NDR_LOGGING = "ndr.logging"
+NDR_CONTRACT_VERSION = 1
 NDR_FIELDS = {"domain", "family", "service-name", "host", "router-id"}
 NDR_LABEL = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 NDR_HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
 
 
-def parse_dynamic_routing_instances(value: str) -> list[dict[str, str]]:
+def parse_dynamic_routing_instances(value: str) -> list[dict]:
     """Validate the local agent plan before applying it."""
     instances = json.loads(value)
     if not isinstance(instances, list):
         raise ValueError("instances must be a JSON array")
     for entry in instances:
         _validate_dynamic_routing_instance(entry)
-    if len({(entry["domain"], entry["family"]) for entry in instances}) != len(
-        instances
-    ):
-        raise ValueError("duplicate instance domain and address family")
+    if len({entry["domain"] for entry in instances}) != len(instances):
+        raise ValueError("duplicate instance domain")
     for field in ("service-name", "host", "router-id"):
         if len({entry[field] for entry in instances}) != len(instances):
             raise ValueError(f"duplicate instance {field}")
@@ -76,11 +82,11 @@ def parse_dynamic_routing_instances(value: str) -> list[dict[str, str]]:
 
 def _validate_dynamic_routing_instance(entry: object) -> None:
     """Check one instance before storing its identity or starting its agent."""
-    if not isinstance(entry, dict) or entry.keys() != NDR_FIELDS:
+    if not isinstance(entry, dict) or entry.keys() != NDR_FIELDS | {"peering"}:
         raise ValueError("each instance must contain the NDR fields")
     if not all(
-        isinstance(item, str) and 0 < len(item) <= 255
-        for item in entry.values()
+        isinstance(entry[field], str) and 0 < len(entry[field]) <= 255
+        for field in NDR_FIELDS
     ):
         raise ValueError("instance fields must be strings of 1-255 characters")
     if entry["family"] not in {"ipv4", "ipv6"}:
@@ -90,7 +96,10 @@ def _validate_dynamic_routing_instance(entry: object) -> None:
             raise ValueError(f"invalid instance {field}")
     if not NDR_HOST.fullmatch(entry["host"]):
         raise ValueError("invalid instance host")
-    router_id = ipaddress.IPv4Address(entry["router-id"])
+    try:
+        router_id = ipaddress.IPv4Address(entry["router-id"])
+    except ipaddress.AddressValueError as error:
+        raise ValueError("router ID must be an IPv4 address") from error
     if router_id.is_unspecified or router_id.is_multicast:
         raise ValueError("router ID must be a nonzero unicast IPv4 address")
 
@@ -144,6 +153,10 @@ class OpenstackNetworkAgentsOperatorCharm(
             self._list_nics_action,
         )
         self.framework.observe(
+            self.on.validate_dynamic_routing_instances_action,
+            self._validate_dynamic_routing_instances_action,
+        )
+        self.framework.observe(
             self.on.set_dynamic_routing_instances_action,
             self._set_dynamic_routing_instances_action,
         )
@@ -152,6 +165,15 @@ class OpenstackNetworkAgentsOperatorCharm(
         )
         self.framework.observe(
             self.on.amqp_relation_changed, self._on_amqp_changed
+        )
+        self._loki_consumer = LokiPushApiConsumer(
+            self, relation_name="logging", forward_alert_rules=False
+        )
+        self.framework.observe(
+            self.on.logging_relation_changed, self._on_logging_changed
+        )
+        self.framework.observe(
+            self.on.logging_relation_broken, self._on_logging_changed
         )
 
     @property
@@ -350,7 +372,13 @@ class OpenstackNetworkAgentsOperatorCharm(
             return {}
         if ":" in hostname and not hostname.startswith("["):
             hostname = f"[{hostname}]"
-        port = interface.ssl_port or self.amqp.DEFAULT_PORT
+        ssl_port = interface.ssl_port
+        ca_cert = interface.ssl_ca
+        if bool(ssl_port) != bool(ca_cert):
+            # Relation data can arrive in steps. Keep agents paused if
+            # only one half of the advertised TLS configuration is present.
+            return {}
+        port = ssl_port or self.amqp.DEFAULT_PORT
         transport = {
             "transport-url": (
                 f"rabbit://{quote(self.amqp.username, safe='')}:"
@@ -358,10 +386,7 @@ class OpenstackNetworkAgentsOperatorCharm(
                 f"{quote(self.amqp.vhost, safe='')}"
             ),
         }
-        if interface.ssl_port:
-            ca_cert = interface.ssl_ca
-            if not ca_cert:
-                return {}
+        if ca_cert:
             try:
                 x509.load_pem_x509_certificates(ca_cert.encode())
             except ValueError:
@@ -369,16 +394,21 @@ class OpenstackNetworkAgentsOperatorCharm(
             transport["ca-cert"] = ca_cert
         return transport
 
+    def _read_dynamic_routing_config(self) -> dict | None:
+        raw = (
+            self.get_snap().get(None, typed=True).get("ndr", {}).get("config")
+        )
+        return json.loads(raw) if isinstance(raw, str) else raw
+
     def _configure_dynamic_routing(
         self,
-        instances: list[dict[str, str]] | None = None,
+        instances: list[dict] | None = None,
         *,
         amqp_available: bool = True,
     ) -> bool:
         """Store placement in the snap and supply transport while AMQP is ready."""
         snap_service = self.get_snap()
-        raw = snap_service.get(None, typed=True).get("ndr", {}).get("config")
-        current = json.loads(raw) if isinstance(raw, str) else raw
+        current = self._read_dynamic_routing_config()
         # Import older placements once if AMQP loss cleared the snap config.
         legacy = getattr(self._state, "ndr_instances", None)
         if instances is None:
@@ -408,27 +438,127 @@ class OpenstackNetworkAgentsOperatorCharm(
             self._state.ndr_instances = None
         return not instances or bool(transport)
 
+    def _run_dynamic_routing(
+        self, command: str, payload: str | None = None
+    ) -> dict:
+        """Call the installed snap's host placement interface."""
+        result = subprocess.run(
+            ["snap", "run", self.snap_name, "dynamic-routing", command],
+            input=payload,
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+        if result.returncode:
+            if command == "validate" and result.stderr.strip():
+                raise ValueError(result.stderr.strip())
+            raise ValueError(
+                f"Network agents snap failed to {command} dynamic routing."
+            )
+        response = json.loads(result.stdout)
+        if not isinstance(response, dict):
+            raise ValueError(
+                "Network agents snap returned invalid dynamic routing data."
+            )
+        return response
+
+    def _validate_dynamic_routing_plan(
+        self, event: ops.ActionEvent
+    ) -> tuple[list[dict], dict[str, str]]:
+        """Return the snap's canonical attachment plan and managed addresses."""
+        if event.params["contract-version"] != NDR_CONTRACT_VERSION:
+            raise ValueError(
+                "Unsupported dynamic routing placement contract version."
+            )
+        instances = parse_dynamic_routing_instances(event.params["instances"])
+        response = self._run_dynamic_routing("validate", json.dumps(instances))
+        if response.get("contract-version") != NDR_CONTRACT_VERSION:
+            raise ValueError(
+                "Installed network agents snap has an incompatible NDR contract."
+            )
+        instances = parse_dynamic_routing_instances(
+            json.dumps(response.get("instances"))
+        )
+        addresses = ndr_peering.validate_addresses(
+            response.get("managed-addresses")
+        )
+        ndr_peering.managed_fragment(
+            ndr_peering.NETPLAN_PATH, required=bool(addresses)
+        )
+        return instances, addresses
+
+    def _validate_dynamic_routing_instances_action(
+        self, event: ops.ActionEvent
+    ) -> None:
+        """Validate the complete unit plan without modifying network or snap state."""
+        try:
+            instances, _ = self._validate_dynamic_routing_plan(event)
+            current = self._read_dynamic_routing_config() or {}
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            TypeError,
+            ValueError,
+        ) as error:
+            event.fail(str(error))
+            return
+        event.set_results(
+            {
+                "contract-version": NDR_CONTRACT_VERSION,
+                "instances": json.dumps(instances),
+                "saved-instances": json.dumps(
+                    current.get(
+                        "paused-instances", current.get("instances", [])
+                    )
+                ),
+            }
+        )
+
     def _set_dynamic_routing_instances_action(
         self, event: ops.ActionEvent
     ) -> None:
         """Replace the desired dynamic routing plans for this unit."""
         try:
-            instances = parse_dynamic_routing_instances(
-                event.params["instances"]
-            )
-        except (TypeError, ValueError):
-            event.fail("Invalid dynamic routing instance list")
+            instances, addresses = self._validate_dynamic_routing_plan(event)
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            TypeError,
+            ValueError,
+        ) as error:
+            event.fail(str(error))
             return
         try:
             configured = self._configure_dynamic_routing(instances)
-        except (self.snap_module.SnapError, TimeoutError):
+            # The snap creates protected ports before Netplan assigns addresses.
+            # On removal, the snap stops agents and removes ports first.
+            ndr_peering.reconcile_addresses(
+                ndr_peering.NETPLAN_PATH, addresses
+            )
+            ready = self._dynamic_routing_ready()
+        except (
+            self.snap_module.SnapError,
+            OSError,
+            subprocess.SubprocessError,
+            ValueError,
+        ):
             event.fail(
-                "Failed to apply the dynamic routing configuration to the snap"
+                "Failed to reconcile dynamic routing on this unit. Correct the host configuration and retry."
             )
             return
         event.set_results(
-            {"configured": configured, "instances": len(instances)}
+            {"configured": configured and ready, "instances": len(instances)}
         )
+
+    @tenacity.retry(
+        retry=tenacity.retry_if_result(lambda ready: not ready),
+        stop=tenacity.stop_after_attempt(4),
+        wait=tenacity.wait_fixed(1),
+        retry_error_callback=lambda _: False,
+    )
+    def _dynamic_routing_ready(self) -> bool:
+        """Allow a short delay for asynchronous address assignment and IPv6 DAD."""
+        return self._run_dynamic_routing("reconcile").get("ready") is True
 
     def _on_amqp_lost(self, event: ops.RelationBrokenEvent) -> None:
         """Remove the transport immediately when the AMQP relation is removed."""
@@ -438,6 +568,63 @@ class OpenstackNetworkAgentsOperatorCharm(
         """Stop agents if credentials are removed without breaking the relation."""
         if not self.amqp.ready:
             self.stop_services({"amqp"})
+
+    def _on_logging_changed(self, event: ops.RelationEvent) -> None:
+        """Update log forwarding without touching the agent configuration."""
+        self._configure_dynamic_routing_logging(
+            available=not isinstance(event, ops.RelationBrokenEvent)
+        )
+
+    def _loki_endpoint_urls(self) -> list[str]:
+        """Return deduplicated Loki endpoints that contain no credentials."""
+        urls = set()
+        for endpoint in self._loki_consumer.loki_endpoints:
+            url = endpoint["url"]
+            parts = urlsplit(url)
+            if (
+                parts.scheme in {"http", "https"}
+                and parts.hostname
+                and parts.username is None
+                and parts.password is None
+            ):
+                urls.add(url)
+        return sorted(urls)
+
+    def _configure_dynamic_routing_logging(
+        self, available: bool = True
+    ) -> None:
+        """Pass Loki endpoints and Juju topology to the snap separately."""
+        snap_service = self.get_snap()
+        if not snap_service.present:
+            return
+        try:
+            endpoints = self._loki_endpoint_urls() if available else []
+        except (AttributeError, TypeError, ValueError):
+            logger.warning("Ignoring malformed Loki endpoint relation data.")
+            return
+        current = (
+            snap_service.get(None, typed=True).get("ndr", {}).get("logging")
+        )
+        if not endpoints and current is None:
+            return
+        desired = {
+            "endpoints": endpoints,
+            "labels": {
+                "juju_model": self.model.name,
+                "juju_model_uuid": self.model.uuid,
+                "juju_application": self.app.name,
+                "juju_unit": self.unit.name,
+            },
+        }
+        rendered = json.dumps(desired, sort_keys=True)
+        if current not in (desired, rendered):
+            try:
+                snap_service.set({NDR_LOGGING: rendered}, typed=True)
+            except self.snap_module.SnapError:
+                # Logging is optional and must not block agent configuration.
+                logger.warning(
+                    "The snap could not configure NDR log forwarding."
+                )
 
     def configure_snap(self, event: ops.EventBase) -> None:
         """Push configuration into the snap."""
@@ -453,6 +640,7 @@ class OpenstackNetworkAgentsOperatorCharm(
             snap_data["network.ip-address"] = data_addr
         self.set_snap_data(snap_data)
         self._configure_dynamic_routing()
+        self._configure_dynamic_routing_logging()
 
     def _agent_cli_cmd(self, cmd: str):
         """Helper to run cli commands on the snap."""

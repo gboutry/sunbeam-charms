@@ -23,6 +23,10 @@ requires:
     interface: rabbitmq
     optional: true
     limit: 1
+  logging:
+    interface: loki_push_api
+    optional: true
+    limit: 1
 
 extra-bindings:
   data: null
@@ -58,18 +62,32 @@ config:
         extra-binding and pass it to the snap as network.ip-address.
 
 actions:
+  validate-dynamic-routing-instances:
+    description: Validate a complete per-unit dynamic routing placement without applying it.
+    params:
+      contract-version:
+        type: integer
+        description: Version of the per-unit dynamic routing placement contract.
+      instances:
+        type: string
+        description: JSON array of resolved instances with their peering attachments.
+    required: [contract-version, instances]
+    additionalProperties: false
   set-dynamic-routing-instances:
     description: Replace the desired list of dynamic routing agents on this unit.
     params:
+      contract-version:
+        type: integer
+        description: Version of the per-unit dynamic routing placement contract.
       instances:
         type: string
         description: |
           JSON array of instances with domain, family (ipv4 or ipv6),
-          service-name, host, and router-id (an IPv4 address) fields.
+          service-name, host, router-id (an IPv4 address), and peering fields.
           An empty array removes all local instances.
           Without AMQP credentials, the snap saves the placement and
           keeps the agents stopped.
-    required: [instances]
+    required: [contract-version, instances]
     additionalProperties: false
   set-network-agents-local-settings:
     description: |
