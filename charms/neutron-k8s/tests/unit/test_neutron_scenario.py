@@ -24,6 +24,9 @@ from pathlib import (
 )
 
 import pytest
+from charm import (
+    NeutronOperatorCharm,
+)
 from ops import (
     testing,
 )
@@ -41,6 +44,60 @@ from ops_sunbeam.test_utils_scenario import (
 
 CHARM_ROOT = Path(__file__).parents[2]
 MANDATORY_RELATIONS = mandatory_relations_from_charmcraft(CHARM_ROOT)
+
+
+@pytest.mark.parametrize(
+    ("current", "current_exit_code", "error"),
+    [
+        (
+            "f399fa0f5f25 (expand) (head)\na589fdb5724c (contract) (head)\n",
+            0,
+            None,
+        ),
+        (
+            "f399fa0f5f25 (expand) (head)\n61cc795e43e8 (contract)\n",
+            0,
+            "not at",
+        ),
+        ("", 0, "not at"),
+        ("", 1, "Unable to read"),
+    ],
+)
+def test_check_dynamic_routing_readiness(
+    ctx, current, current_exit_code, error
+):
+    """The action requires both installed NDR heads before enabling agents."""
+    command = next(
+        cmd
+        for cmd in NeutronOperatorCharm.db_sync_cmds
+        if "neutron-dynamic-routing" in cmd
+    )[:-2]
+    state = testing.State(
+        containers=[
+            testing.Container(
+                name="neutron-server",
+                can_connect=True,
+                execs=[
+                    testing.Exec(
+                        command_prefix=[*command, "heads"],
+                        stdout="a589fdb5724c (contract) (head)\nf399fa0f5f25 (expand) (head)\n",
+                    ),
+                    testing.Exec(
+                        command_prefix=[*command, "current"],
+                        stdout=current,
+                        return_code=current_exit_code,
+                    ),
+                ],
+            )
+        ]
+    )
+    action = ctx.on.action("check-dynamic-routing-readiness")
+    if error:
+        with pytest.raises(testing.ActionFailed, match=error):
+            ctx.run(action, state)
+    else:
+        ctx.run(action, state)
+        assert ctx.action_results == {"ready": True}
 
 
 class TestAllRelations:

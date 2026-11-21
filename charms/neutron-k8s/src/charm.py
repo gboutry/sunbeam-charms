@@ -51,6 +51,9 @@ from ops.model import (
 
 logger = logging.getLogger(__name__)
 
+NDR_PROJECT = "neutron-dynamic-routing"
+MIGRATION_REVISION = re.compile(r"^([0-9a-f]{12})(?:\s+\([^\n]+\))*\s*$")
+
 BAREMETAL_SWITCH_CONFIG_RELATION = "baremetal-switch-config"
 ML2_BAREMETAL_CONF = (
     "/etc/neutron/plugins/ml2/ml2_conf_networking_baremetal.ini"
@@ -575,7 +578,7 @@ class NeutronOperatorCharm(sunbeam_charm.OSBaseOperatorAPICharm):
         ]
         for subproject in (
             "neutron",
-            "neutron-dynamic-routing",
+            NDR_PROJECT,
             "neutron-vpnaas",
         )
     ]
@@ -585,6 +588,45 @@ class NeutronOperatorCharm(sunbeam_charm.OSBaseOperatorAPICharm):
         """Run constructor."""
         super().__init__(framework)
         self.framework.observe(self.on.upgrade_charm, self._on_upgrade_charm)
+        self.framework.observe(
+            self.on.check_dynamic_routing_readiness_action,
+            self._check_dynamic_routing_readiness,
+        )
+
+    def _check_dynamic_routing_readiness(self, event: ops.ActionEvent) -> None:
+        """Check installed NDR migration heads without modifying the database."""
+        container = self.unit.get_container(self.db_sync_container_name)
+        if not container.can_connect():
+            event.fail("The Neutron workload container is not ready.")
+            return
+        command = next(cmd for cmd in self.db_sync_cmds if NDR_PROJECT in cmd)[
+            :-2
+        ]
+        revisions = {}
+        try:
+            for subcommand in ("heads", "current"):
+                process = container.exec([*command, subcommand], timeout=30)
+                stdout, _ = process.wait_output()
+                revisions[subcommand] = {
+                    match[1]
+                    for line in stdout.splitlines()
+                    if (match := MIGRATION_REVISION.fullmatch(line.strip()))
+                }
+        except ops.pebble.Error:
+            # Migration output can contain deployment connection information.
+            event.fail(
+                "Unable to read the installed and applied NDR migration revisions."
+            )
+            return
+        if (
+            not revisions["heads"]
+            or revisions["heads"] != revisions["current"]
+        ):
+            event.fail(
+                "The Neutron Dynamic Routing database is not at its installed migration heads."
+            )
+            return
+        event.set_results({"ready": True})
 
     def _on_upgrade_charm(self, event: ops.framework.EventBase):
         """Handle the upgrade charm event."""

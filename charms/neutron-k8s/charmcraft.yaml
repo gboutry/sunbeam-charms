@@ -129,6 +129,9 @@ config:
       type: string
 
 actions:
+  check-dynamic-routing-readiness:
+    description: Check that the installed NDR migration heads are applied.
+    additionalProperties: false
   pause:
     description: Pause container services
     additionalProperties: false
